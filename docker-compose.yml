@@ -1,0 +1,167 @@
+# FastChat -- "Everything in Docker" setup.
+#
+# Run: docker compose up --build
+#
+# This brings up SEVEN containers on an isolated Docker network:
+#   postgres          -- database, schema auto-applied on first run
+#   redis             -- cross-instance message fan-out
+#   cert-init         -- one-shot: generates the shared dev TLS cert, then exits
+#   api               -- FastAPI auth service
+#   socket-server-1   -- asyncio TLS chat server, instance 1
+#   socket-server-2   -- asyncio TLS chat server, instance 2 (deliberately a
+#                        SECOND instance, not a replica count, so we can
+#                        prove Redis Pub/Sub cross-instance delivery is
+#                        actually working rather than trusting it blindly)
+#   nginx             -- TCP load balancer in front of both socket-server
+#                        instances (this is what `client.py` actually talks
+#                        to on port 8443)
+#
+# FASTCHAT_JWT_SECRET is pulled from the SAME .env file the rest of this
+# project already uses (Docker Compose auto-loads a `.env` in this
+# directory for ${VAR} substitution below) -- no separate Docker-specific
+# secrets file needed.
+#
+# FASTCHAT_DB_DSN and FASTCHAT_REDIS_URL are set explicitly per-service
+# below to point at the Docker service names (`postgres`, `redis`)
+# rather than `localhost` -- inside the Docker network, `localhost` would
+# mean "this container," not "the postgres container."
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fastchat
+      POSTGRES_PASSWORD: fastchat
+      POSTGRES_DB: fastchat
+    # Default max_connections (100) is too low once you account for BOTH
+    # socket-server instances' pools (FASTCHAT_DB_POOL_MAX_SIZE each,
+    # default 50) plus the API's own pool (max_size=20) -- that's up to
+    # 120 possible connections against a 100 ceiling, which would produce
+    # "FATAL: too many connections" under real load, not a graceful
+    # slowdown. Raised here with headroom; shared_buffers bumped up to
+    # match (25% of container memory is the usual starting rule of thumb --
+    # adjust alongside docker-compose.bench.yml's postgres memory limit if
+    # you change that).
+    command: postgres -c max_connections=200 -c shared_buffers=256MB
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Official Postgres images auto-run any .sql file placed here, but
+      # ONLY the first time the data volume is initialized (an empty
+      # volume). This is what makes "wipe the DB and start fresh" as
+      # simple as: docker compose down -v
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      - "5432:5432"   # exposed to host for local psql/debugging convenience
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastchat -d fastchat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"   # exposed to host for local debugging convenience
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: generates server/certs/{server.crt,server.key} via the
+  # pure-Python generator (no openssl CLI needed in the image). Reuses the
+  # socket-server image since it already has `cryptography` installed.
+  # Bind-mounted to the HOST's ./server/certs (not a Docker-only named
+  # volume) specifically so client.py -- which runs on your host machine,
+  # not in a container -- can find the same cert for TLS verification.
+  cert-init:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: ["python", "/app/deployment/gen_dev_certs.py"]
+    volumes:
+      - ./server/certs:/app/server/certs
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      FASTCHAT_JWT_SECRET: ${FASTCHAT_JWT_SECRET}
+      FASTCHAT_DB_DSN: postgresql://fastchat:fastchat@postgres:5432/fastchat
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+
+  socket-server-1:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      FASTCHAT_JWT_SECRET: ${FASTCHAT_JWT_SECRET}
+      FASTCHAT_DB_DSN: postgresql://fastchat:fastchat@postgres:5432/fastchat
+      FASTCHAT_REDIS_URL: redis://redis:6379/0
+      FASTCHAT_REDIS_CHANNEL_PREFIX: fastchat:user
+      FASTCHAT_PORT: "8443"
+      # See docker-compose.yml's postgres command and BENCHMARKING.md --
+      # tune these to your actual Postgres capacity when load testing.
+      FASTCHAT_DB_POOL_MIN_SIZE: "10"
+      FASTCHAT_DB_POOL_MAX_SIZE: "50"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./server/certs:/app/server/certs:ro
+    ports:
+      # Direct access, BYPASSING the load balancer -- useful for proving
+      # which specific instance a client is talking to during testing.
+      # Normal usage goes through nginx on 8443 instead (see below).
+      - "8444:8443"
+
+  socket-server-2:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      FASTCHAT_JWT_SECRET: ${FASTCHAT_JWT_SECRET}
+      FASTCHAT_DB_DSN: postgresql://fastchat:fastchat@postgres:5432/fastchat
+      FASTCHAT_REDIS_URL: redis://redis:6379/0
+      FASTCHAT_REDIS_CHANNEL_PREFIX: fastchat:user
+      FASTCHAT_PORT: "8443"
+      # See docker-compose.yml's postgres command and BENCHMARKING.md --
+      # tune these to your actual Postgres capacity when load testing.
+      FASTCHAT_DB_POOL_MIN_SIZE: "10"
+      FASTCHAT_DB_POOL_MAX_SIZE: "50"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./server/certs:/app/server/certs:ro
+    ports:
+      - "8445:8443"   # direct access, bypassing the load balancer
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./deployment/nginx.docker.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - socket-server-1
+      - socket-server-2
+    ports:
+      # This is the port client.py actually connects to (SERVER_PORT =
+      # 8443 in client.py's default config) -- clients talk to the load
+      # balancer, never to a specific instance directly.
+      - "8443:8443"
+
+volumes:
+  pg_data:

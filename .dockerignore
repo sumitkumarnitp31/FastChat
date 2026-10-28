@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+venv/
+.venv/
+__pycache__/
+*.pyc
+server/certs/
+server/.fastchat_identities/
+*.md

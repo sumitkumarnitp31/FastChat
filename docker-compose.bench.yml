@@ -1,0 +1,70 @@
+# docker-compose.bench.yml
+# =========================
+# Additive override for benchmarking on a SHARED machine (no Docker Desktop,
+# just Docker running natively inside WSL2, or any single-box setup where
+# the load generator and the server compete for the same physical cores).
+#
+# Normal development uses just `docker compose up --build` (unconstrained).
+# Benchmarking uses BOTH files together:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bench.yml up --build -d
+#
+# WHY THIS EXISTS: without Docker Desktop's GUI "CPUs/Memory" sliders,
+# there's no global cap on how much of the host's cores Docker can use.
+# Left unconstrained, the stack (especially under load) can consume every
+# core, starving the load-test Python process running natively alongside
+# it on the same machine -- which would make the SERVER look artificially
+# slow, since it's actually competing with its own load generator for CPU.
+#
+# `cpus:` here uses the Compose Spec's `deploy.resources.limits` field,
+# which Compose V2 (the `docker compose` plugin) applies to plain
+# `docker compose up` even OUTSIDE Swarm mode -- no Swarm init needed.
+#
+# TOTAL BUDGET: these limits sum to roughly 8 cores. On a 12-core/16-thread
+# machine (e.g. an i5-12500H), that deliberately leaves ~4 cores plus
+# Windows/WSL2 overhead free for load_test.py and the OS itself. Adjust
+# the numbers below to roughly (your core count - 3 to 4) if your machine
+# differs.
+
+services:
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+
+  socket-server-1:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.75"
+          memory: 1G
+
+  socket-server-2:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.75"
+          memory: 1G
+
+  nginx:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M

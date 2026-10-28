@@ -1,0 +1,23 @@
+# --- Shared: .env auto-loading for both the API and socket server ---
+python-dotenv==1.0.1
+
+# --- Socket server (server/tcp_server.py) ---
+asyncpg==0.29.0
+PyJWT==2.8.0
+redis==5.0.4          # optional: only needed for multi-instance fan-out (Phase 4)
+
+# --- Client (server/client.py) ---
+cryptography==42.0.5  # X25519 + AES-GCM for the E2E encryption layer
+
+# --- API (api/main.py, FastAPI) ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1   # ASGI server; run with multiple workers in production
+pydantic[email]==2.7.4      # EmailStr validation support
+bcrypt==4.1.3
+# NOTE: asyncpg and PyJWT above are shared with the socket server, so the
+# API tier now uses the exact same async DB driver as tcp_server.py --
+# no separate psycopg2/threaded-pool stack needed anymore.
+
+# --- Load testing (scripts/load_test.py) ---
+# Not needed to run the app itself -- only for scripts/load_test.py.
+aiohttp==3.9.5
